@@ -92,60 +92,86 @@ def detect_arbitrage(arb_data: Dict) -> Dict:
     return opportunity
 
 def scan_markets_once() -> int:
-    '''
+    """
     Perform one complete scan of all active markets.
     Detects and logs all arbitrage opportunities.
 
     Returns:
         Number of opportunities detected in this scan
-    '''
+    """
+    scan_start = time.time()  # Track total scan time
+    
     logger.info("=" * 60)
     logger.info("Starting market scan...")
-
+    
     # Fetch all active markets
+    fetch_start = time.time()
     markets = fetch_markets.fetch_active_markets(limit_per_page=100, max_markets=1000)
-
+    fetch_duration = time.time() - fetch_start
+    
     if not markets:
         logger.warning("No markets fetched. Check API connectivity.")
         return 0
     
-    # DEBUG: log raw JSON for the first market only
-    first_market = markets[0]
-    logger.debug(f"First market raw JSON: {first_market}")
-
+    logger.info(f"Fetched {len(markets)} active markets in {fetch_duration:.2f}s")
+    
+    # Sample first 3 market titles
+    for m in markets[:3]:
+        title = m.get('question', 'Unknown')[:60]
+        mid = m.get('condition_id') or m.get('id')
+        logger.info(f"  Sample market {mid}: {title}")
+    
+    # Process markets
+    process_start = time.time()
     opportunities_found = 0
-
-    # For each market, check each target size
+    markets_processed = 0
+    markets_skipped = 0
+    total_markets_to_process = len(markets) * len(config.TARGET_SIZES)
+    
+    logger.info(f"Processing {len(markets)} markets × {len(config.TARGET_SIZES)} sizes = {total_markets_to_process} total checks...")
+    
+    # Progress logging every N checks
+    progress_interval = 10  # Log every 10 checks
+    next_progress_log = progress_interval
+    
     for market in markets:
         market_title = market.get('question', 'Unknown')
-
+        
         for target_size in config.TARGET_SIZES:
+            markets_processed += 1
+            
+            # Progress update
+            if markets_processed >= next_progress_log:
+                elapsed = time.time() - process_start
+                rate = markets_processed / elapsed if elapsed > 0 else 0
+                remaining = total_markets_to_process - markets_processed
+                eta = remaining / rate if rate > 0 else 0
+                
+                logger.info(
+                    f"Progress: {markets_processed}/{total_markets_to_process} "
+                    f"({markets_processed/total_markets_to_process*100:.1f}%) | "
+                    f"Rate: {rate:.1f} checks/sec | "
+                    f"ETA: {eta:.1f}s | "
+                    f"Opportunities: {opportunities_found}"
+                )
+                next_progress_log += progress_interval
+            
             # Get arbitrage data (VWAPs, book depth)
             arb_data = fetch_markets.get_market_arbitrage_data(market, target_size)
-
+            
             if not arb_data:
+                markets_skipped += 1
                 continue  # Skip if insufficient liquidity or not binary
-
-            # DEBUG: for the first few markets per scan, show VWAPs
-            # This tells us we're actually reading order books and computing prices
-            if opportunities_found < 3:
-                logger.info(
-                    f"Market: {market_title[:60]}... | "
-                    f"Size: ${target_size} | "
-                    f"VWAP_YES: {arb_data['vwap_yes']:.4f} | "
-                    f"VWAP_NO: {arb_data['vwap_no']:.4f} | "
-                    f"Depth YES/NO: {arb_data['yes_book_depth']}/{arb_data['no_book_depth']}"
-                )
-
+            
             # Check for arbitrage opportunity
             opportunity = detect_arbitrage(arb_data)
-
+            
             if opportunity:
                 edge_pct = opportunity['edge_decimal'] * 100
-
+                
                 # Log to database
                 database.log_opportunity(opportunity)
-
+                
                 # Update persistence tracking
                 database.update_persistence(
                     opportunity['opportunity_hash'],
@@ -154,24 +180,34 @@ def scan_markets_once() -> int:
                     opportunity['timestamp'],
                     opportunity['edge_decimal']
                 )
-
+                
                 # Console log for significant opportunities
                 if opportunity['edge_decimal'] >= min(config.EDGE_THRESHOLDS):
                     logger.info(
-                        f"OPPORTUNITY FOUND: {market_title[:50]}... | "
+                        f"💰 OPPORTUNITY FOUND: {market_title[:50]}... | "
                         f"Size: ${target_size} | Edge: {edge_pct:.2f}% | "
                         f"YES: {opportunity['vwap_yes']:.4f} | "
                         f"NO: {opportunity['vwap_no']:.4f}"
                     )
-
+                
                 opportunities_found += 1
-
-
-    logger.info(
-        f"Scan complete. Opportunities found: {opportunities_found} "
-        f"| Markets scanned: {len(markets)}"
-    )
-
+    
+    # Summary
+    process_duration = time.time() - process_start
+    total_duration = time.time() - scan_start
+    
+    logger.info("=" * 60)
+    logger.info("SCAN SUMMARY:")
+    logger.info(f"  Total markets fetched: {len(markets)}")
+    logger.info(f"  Total checks performed: {markets_processed}")
+    logger.info(f"  Markets skipped (illiquid/non-binary): {markets_skipped}")
+    logger.info(f"  Opportunities found: {opportunities_found}")
+    logger.info(f"  Fetch time: {fetch_duration:.2f}s")
+    logger.info(f"  Processing time: {process_duration:.2f}s")
+    logger.info(f"  Total scan time: {total_duration:.2f}s")
+    logger.info(f"  Average rate: {markets_processed/process_duration:.1f} checks/sec")
+    logger.info("=" * 60)
+    
     return opportunities_found
 
 def run_continuous_scanner():

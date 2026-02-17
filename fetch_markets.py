@@ -17,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(config.LOG_FILE),
+        logging.FileHandler(config.LOG_FILE, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -107,6 +107,42 @@ def fetch_active_markets(limit: int = 100) -> List[Dict]:
     except Exception as e:
         logger.error(f"Error fetching markets: {e}")
         return []
+
+def fetch_order_book(token_id: str) -> Dict:
+    """
+    Fetch the order book for a specific token from CLOB API.
+    
+    Args:
+        token_id: The token ID to fetch order book for
+        
+    Returns:
+        Dictionary with 'asks' and 'bids' lists
+    """
+    try:
+        url = f"{config.CLOB_API_BASE}/book"
+        params = {
+            'token_id': token_id
+        }
+        
+        logger.debug(f"Fetching order book for token {token_id}...")
+        data = make_request_with_retry(url, params)
+        
+        # CLOB API returns structure like:
+        # {
+        #   "market": "...",
+        #   "asset_id": "...",
+        #   "bids": [{"price": "0.52", "size": "100"}, ...],
+        #   "asks": [{"price": "0.48", "size": "50"}, ...]
+        # }
+        
+        return {
+            'asks': data.get('asks', []),
+            'bids': data.get('bids', [])
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching order book for token {token_id}: {e}")
+        return {'asks': [], 'bids': []}
 
 def fetch_active_markets(limit_per_page: int = 100, max_markets: int = 1000) -> List[Dict]:
     """
@@ -219,7 +255,7 @@ def calculate_vwap(orders: List[Dict], target_size: float) -> Tuple[float, int]:
     return vwap, depth_count
 
 def get_market_arbitrage_data(market: Dict, target_size: float) -> Optional[Dict]:
-    '''
+    """
     Fetch and compute arbitrage data for a single market at a target size.
 
     Args:
@@ -228,22 +264,34 @@ def get_market_arbitrage_data(market: Dict, target_size: float) -> Optional[Dict
 
     Returns:
         Dictionary with arbitrage opportunity data or None if not applicable
-    '''
+    """
     try:
+        import json
+
         # Extract market metadata
         market_id = market.get('condition_id') or market.get('id')
         market_title = market.get('question', 'Unknown')
-        tokens = market.get('tokens', [])
 
-        # We need exactly 2 outcome tokens (binary market)
-        if len(tokens) != 2:
+        # KEY: Gamma API uses clobTokenIds, not tokens
+        clob_token_ids_raw = market.get('clobTokenIds', '')
+
+        # Parse clobTokenIds into a list of two token IDs
+        if isinstance(clob_token_ids_raw, str) and clob_token_ids_raw:
+            try:
+                clob_token_ids = json.loads(clob_token_ids_raw)
+            except json.JSONDecodeError:
+                return None
+        elif isinstance(clob_token_ids_raw, list):
+            clob_token_ids = clob_token_ids_raw
+        else:
             return None
 
-        # Identify YES and NO tokens
-        # Assumption: tokens[0] is YES, tokens[1] is NO
-        # Or look for 'outcome' field
-        token_yes = tokens[0].get('token_id')
-        token_no = tokens[1].get('token_id')
+        # Need exactly 2 tokens (binary market)
+        if len(clob_token_ids) != 2:
+            return None
+
+        token_yes = clob_token_ids[0]
+        token_no = clob_token_ids[1]
 
         if not token_yes or not token_no:
             return None
@@ -252,13 +300,11 @@ def get_market_arbitrage_data(market: Dict, target_size: float) -> Optional[Dict
         book_yes = fetch_order_book(token_yes)
         book_no = fetch_order_book(token_no)
 
-        # We want to BUY both (take asks)
+        # Take asks on both sides (taker)
         asks_yes = book_yes.get('asks', [])
         asks_no = book_no.get('asks', [])
 
-        # DEBUG: log first 3 raw ask levels for each side for the first market(s)
-        # to confirm we're seeing real order book data. This is limited so we
-        # don't spam the console.
+        # Optional debug: first 3 ask levels
         if asks_yes and asks_no:
             logger.debug(
                 f"RAW YES asks (first 3): "
@@ -269,23 +315,22 @@ def get_market_arbitrage_data(market: Dict, target_size: float) -> Optional[Dict
                 f"{[(a['price'], a['size']) for a in asks_no[:3]]}"
             )
 
-
-        # Calculate VWAP for target size
+        # VWAP for target size on both legs
         vwap_yes, depth_yes = calculate_vwap(asks_yes, target_size)
         vwap_no, depth_no = calculate_vwap(asks_no, target_size)
 
-        # If either side has insufficient liquidity, skip
+        # Skip if insufficient liquidity
         if vwap_yes == 0.0 or vwap_no == 0.0:
             return None
 
         return {
-            'market_id': market_id,
-            'market_title': market_title,
-            'target_size': target_size,
-            'vwap_yes': vwap_yes,
-            'vwap_no': vwap_no,
-            'yes_book_depth': depth_yes,
-            'no_book_depth': depth_no
+            "market_id": market_id,
+            "market_title": market_title,
+            "target_size": target_size,
+            "vwap_yes": vwap_yes,
+            "vwap_no": vwap_no,
+            "yes_book_depth": depth_yes,
+            "no_book_depth": depth_no,
         }
 
     except Exception as e:
